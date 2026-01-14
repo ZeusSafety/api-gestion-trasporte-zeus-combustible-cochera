@@ -4,13 +4,13 @@ import json
 import requests
 import logging
 
-# 🔧 Configuración de Endpoints y Almacenamiento
+# 🔧 Configuración de APIs y Storage
 API_TOKEN = "https://api-verificacion-token-2946605267.us-central1.run.app"
 API_SUBIDA_ARCHIVOS = "https://api-subida-archivos-2946605267.us-central1.run.app"
+# Base URL para que los links en el GET sean clickeables
 BASE_STORAGE_URL = "https://storage.googleapis.com/archivos_sistema/"
 
 def get_connection():
-    """Establece la conexión con Cloud SQL"""
     return pymysql.connect(
         user="zeussafety-2024",
         password="ZeusSafety2025",
@@ -20,7 +20,7 @@ def get_connection():
     )
 
 def subir_comprobante(archivo):
-    """Sube el archivo a la API de archivos y retorna la URL completa"""
+    """ Sube el archivo y retorna la URL completa """
     try:
         params = {
             "bucket_name": "archivos_sistema",
@@ -28,21 +28,20 @@ def subir_comprobante(archivo):
             "method": "no_encriptar"
         }
         files = {"archivo": (archivo.filename, archivo.read(), archivo.content_type)}
-        response = requests.post(API_SUBIDA_ARCHIVOS, params=params, files=files, timeout=20)
+        response = requests.post(API_SUBIDA_ARCHIVOS, params=params, files=files, timeout=15)
         
         if response.status_code == 200:
             url_recibida = response.json().get("url")
-            # Si recibimos solo la ruta, completamos con el dominio de Google
+            # Si la API devuelve solo la ruta, le agregamos el prefijo de Google
             if url_recibida and not url_recibida.startswith("http"):
                 return f"{BASE_STORAGE_URL}{url_recibida}"
             return url_recibida
         return None
     except Exception as e:
-        logging.error(f"Error en subida de archivo: {str(e)}")
+        logging.error(f"Error en subida: {str(e)}")
         return None
 
 def extraer(request, headers):
-    """Consulta las tablas con JOIN y devuelve datos unificados"""
     conn = get_connection()
     metodo = request.args.get("method")
 
@@ -62,7 +61,7 @@ def extraer(request, headers):
                 cursor.execute(sql)
                 registros = cursor.fetchall()
 
-                # Limpieza de URLs para que sean clickeables en el Frontend/Postman
+                # Asegurar links completos para registros antiguos en la DB
                 for reg in registros:
                     for campo in ['foto_combustible', 'foto_cochera']:
                         if reg[campo] and not reg[campo].startswith("http"):
@@ -70,23 +69,18 @@ def extraer(request, headers):
                 
                 return (json.dumps(registros, default=str), 200, headers)
             
-            return (json.dumps({"error": "Método GET no válido"}), 405, headers)
+            return (json.dumps({"error": "Método GET no reconocido"}), 405, headers)
 
 def insert(request, headers):
-    """Procesa el formulario y distribuye los datos en las 3 tablas"""
     conn = get_connection()
     metodo = request.args.get("method")
     data = request.form 
-
-    # Función interna para validar respuestas afirmativas
-    def es_si(valor):
-        return str(valor).strip().lower() == "si"
 
     with conn:
         with conn.cursor() as cursor:
             if metodo == "registrar_combustible_completo":
                 try:
-                    # 1. Tabla Principal: REGISTRO_VIAJE
+                    # 1. Insertar Viaje Principal
                     sql_viaje = """
                         INSERT INTO REGISTRO_VIAJE (
                             fecha, vehiculo, conductor, km_inicial, km_final, 
@@ -96,49 +90,47 @@ def insert(request, headers):
                     cursor.execute(sql_viaje, (
                         data.get("fecha"), data.get("vehiculo"), data.get("conductor"),
                         data.get("km_inicial"), data.get("km_final"), data.get("miembros_vehiculo"),
-                        1 if es_si(data.get("esta_limpio")) else 0,
-                        1 if es_si(data.get("en_buen_estado")) else 0,
+                        1 if data.get("esta_limpio") == "Si" else 0,
+                        1 if data.get("en_buen_estado") == "Si" else 0,
                         data.get("descripcion_estado")
                     ))
                     id_viaje = cursor.lastrowid
 
-                    # 2. Tabla Secundaria: DETALLE_COMBUSTIBLE
-                    if es_si(data.get("lleno_combustible")):
-                        foto_gas = None
+                    # 2. Lógica de Combustible
+                    if data.get("lleno_combustible") == "Si":
+                        url_gas = None
                         if "file_combustible" in request.files:
-                            foto_gas = subir_comprobante(request.files["file_combustible"])
+                            url_gas = subir_comprobante(request.files["file_combustible"])
                         
                         sql_fuel = """
                             INSERT INTO DETALLE_COMBUSTIBLE (id_viaje, tipo_combustible, precio_total, precio_unitario, url_comprobante)
                             VALUES (%s, %s, %s, %s, %s)
                         """
-                        cursor.execute(sql_fuel, (id_viaje, data.get("tipo_combustible"), data.get("precio_total"), data.get("precio_unitario"), foto_gas))
+                        cursor.execute(sql_fuel, (id_viaje, data.get("tipo_combustible"), data.get("precio_total"), data.get("precio_unitario"), url_gas))
 
-                    # 3. Tabla Secundaria: DETALLE_COCHERA
-                    if es_si(data.get("pago_cochera")):
-                        foto_cochera = None
+                    # 3. Lógica de Cochera
+                    if data.get("pago_cochera") == "Si":
+                        url_cochera = None
                         if "file_cochera" in request.files:
-                            foto_cochera = subir_comprobante(request.files["file_cochera"])
+                            url_cochera = subir_comprobante(request.files["file_cochera"])
 
                         sql_cochera = """
                             INSERT INTO DETALLE_COCHERA (id_viaje, monto_pagado, url_comprobante)
                             VALUES (%s, %s, %s)
                         """
-                        cursor.execute(sql_cochera, (id_viaje, data.get("monto_cochera"), foto_cochera))
+                        cursor.execute(sql_cochera, (id_viaje, data.get("monto_cochera"), url_cochera))
 
                     conn.commit()
-                    return (json.dumps({"success": "Registro guardado correctamente", "id": id_viaje}), 200, headers)
+                    return (json.dumps({"success": "Guardado correctamente", "id": id_viaje}), 200, headers)
 
                 except Exception as e:
                     conn.rollback()
-                    logging.error(f"Error en transacción: {str(e)}")
                     return (json.dumps({"error": str(e)}), 500, headers)
             
-            return (json.dumps({"error": "Método POST no válido"}), 405, headers)
+            return (json.dumps({"error": "Método POST no reconocido"}), 405, headers)
 
 @functions_framework.http
 def hello_http(request):
-    """Punto de entrada principal con CORS y Auth"""
     headers = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
@@ -148,22 +140,21 @@ def hello_http(request):
     if request.method == "OPTIONS":
         return ("", 200, headers)
 
-    # Verificación de Seguridad (Token)
+    # Validación de Token
     auth_header = request.headers.get("Authorization")
     if not auth_header:
-        return (json.dumps({"error": "Falta cabecera de autorización"}), 401, headers)
+        return (json.dumps({"error": "No token"}), 401, headers)
 
     try:
         val_resp = requests.post(API_TOKEN, headers={"Authorization": auth_header}, timeout=10)
         if val_resp.status_code != 200:
-            return (json.dumps({"error": "Token no autorizado"}), 401, headers)
-    except Exception:
-        return (json.dumps({"error": "Servicio de autenticación no disponible"}), 503, headers)
+            return (json.dumps({"error": "Token inválido"}), 401, headers)
+    except:
+        return (json.dumps({"error": "Error auth service"}), 503, headers)
 
-    # Enrutamiento según el método HTTP
     if request.method == "GET":
         return extraer(request, headers)
     elif request.method == "POST":
         return insert(request, headers)
     
-    return (json.dumps({"error": "Método no permitido"}), 405, headers)
+    return (json.dumps({"error": "Invalid Method"}), 405, headers)
