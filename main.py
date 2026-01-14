@@ -3,11 +3,13 @@ import pymysql
 import json
 import requests
 import logging
+from datetime import datetime
+from google.cloud import storage
 
-# 🔧 Configuración de APIs y Storage
+# 🔧 Configuración
 API_TOKEN = "https://api-verificacion-token-2946605267.us-central1.run.app"
-API_SUBIDA_ARCHIVOS = "https://api-subida-archivos-2946605267.us-central1.run.app"
-BASE_STORAGE_URL = "https://storage.googleapis.com/archivos_sistema/"
+BUCKET_NAME = "archivos_sistema"
+BASE_STORAGE_URL = f"https://storage.googleapis.com/{BUCKET_NAME}/"
 
 def get_connection():
     return pymysql.connect(
@@ -18,35 +20,33 @@ def get_connection():
         cursorclass=pymysql.cursors.DictCursor
     )
 
-def subir_comprobante(archivo):
-    """ Sube el archivo y retorna la URL completa o None si falla """
+def subir_a_gcs(archivo, folder="archivos_generales_zeus"):
+    """ Sube directamente a Google Cloud Storage sin pasar por APIs intermedias """
     if not archivo or archivo.filename == '':
         return None
     try:
-        params = {
-            "bucket_name": "archivos_sistema",
-            "folder_bucket": "archivos_generales_zeus",
-            "method": "no_encriptar"
-        }
-        # IMPORTANTE: Leemos el contenido una sola vez
-        contenido = archivo.read()
-        files = {"archivo": (archivo.filename, contenido, archivo.content_type)}
+        # 1. Preparar el cliente de Storage
+        client = storage.Client()
+        bucket = client.bucket(BUCKET_NAME)
         
-        # Aumentamos timeout a 30s porque son 2 imágenes y una API externa
-        response = requests.post(API_SUBIDA_ARCHIVOS, params=params, files=files, timeout=30)
+        # 2. Crear un nombre único para evitar colisiones
+        timestamp = int(datetime.now().timestamp())
+        filename = f"{timestamp}_{archivo.filename.replace(' ', '_')}"
+        blob_path = f"{folder}/{filename}"
         
-        if response.status_code == 200:
-            url_recibida = response.json().get("url")
-            if url_recibida:
-                # Si la API devuelve solo la ruta, agregamos el prefijo
-                if not url_recibida.startswith("http"):
-                    return f"{BASE_STORAGE_URL}{url_recibida}"
-                return url_recibida
+        # 3. Subir el archivo
+        blob = bucket.blob(blob_path)
+        # Aseguramos que el puntero esté al inicio
+        archivo.seek(0)
+        blob.upload_from_string(
+            archivo.read(),
+            content_type=archivo.content_type
+        )
         
-        logging.error(f"Error en API Subida: {response.status_code} - {response.text}")
-        return None
+        logging.info(f"Archivo subido con éxito: {blob_path}")
+        return blob_path # Retornamos la ruta relativa (la base se añade en el GET)
     except Exception as e:
-        logging.error(f"Error excepcional en subida: {str(e)}")
+        logging.error(f"Error subiendo a GCS: {str(e)}")
         return None
 
 def extraer(request, headers):
@@ -56,10 +56,9 @@ def extraer(request, headers):
         with conn.cursor() as cursor:
             if metodo == "listar_registros_combustible":
                 sql = """
-                    SELECT 
-                        V.*, 
-                        C.tipo_combustible, C.precio_total AS gasto_combustible, C.precio_unitario, C.url_comprobante AS foto_combustible,
-                        P.monto_pagado AS gasto_cochera, P.url_comprobante AS foto_cochera
+                    SELECT V.*, 
+                           C.tipo_combustible, C.precio_total AS gasto_combustible, C.precio_unitario, C.url_comprobante AS foto_combustible,
+                           P.monto_pagado AS gasto_cochera, P.url_comprobante AS foto_cochera
                     FROM REGISTRO_VIAJE V
                     LEFT JOIN DETALLE_COMBUSTIBLE C ON V.id_viaje = C.id_viaje
                     LEFT JOIN DETALLE_COCHERA P ON V.id_viaje = P.id_viaje
@@ -67,14 +66,12 @@ def extraer(request, headers):
                 """
                 cursor.execute(sql)
                 registros = cursor.fetchall()
-
                 for reg in registros:
                     for campo in ['foto_combustible', 'foto_cochera']:
                         if reg[campo] and not reg[campo].startswith("http"):
                             reg[campo] = f"{BASE_STORAGE_URL}{reg[campo]}"
-                
                 return (json.dumps(registros, default=str), 200, headers)
-            return (json.dumps({"error": "Método GET no reconocido"}), 405, headers)
+    return (json.dumps({"error": "Método no válido"}), 405, headers)
 
 def insert(request, headers):
     conn = get_connection()
@@ -83,25 +80,20 @@ def insert(request, headers):
 
     if metodo == "registrar_combustible_completo":
         try:
-            # --- 1. PROCESAR ARCHIVOS PRIMERO ---
+            # --- SUBIDA DIRECTA DE ARCHIVOS ---
             url_gas = None
             if "file_combustible" in request.files:
-                url_gas = subir_comprobante(request.files["file_combustible"])
-                logging.info(f"URL Gas generada: {url_gas}")
+                url_gas = subir_a_gcs(request.files["file_combustible"])
 
             url_cochera = None
             if "file_cochera" in request.files:
-                url_cochera = subir_comprobante(request.files["file_cochera"])
-                logging.info(f"URL Cochera generada: {url_cochera}")
+                url_cochera = subir_a_gcs(request.files["file_cochera"])
 
-            # --- 2. INSERCIÓN EN BASE DE DATOS ---
             with conn.cursor() as cursor:
-                # Viaje Principal
+                # 1. Viaje
                 sql_viaje = """
-                    INSERT INTO REGISTRO_VIAJE (
-                        fecha, vehiculo, conductor, km_inicial, km_final, 
-                        miembros_vehiculo, esta_limpio, en_buen_estado, descripcion_estado
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO REGISTRO_VIAJE (fecha, vehiculo, conductor, km_inicial, km_final, miembros_vehiculo, esta_limpio, en_buen_estado, descripcion_estado)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """
                 cursor.execute(sql_viaje, (
                     data.get("fecha"), data.get("vehiculo"), data.get("conductor"),
@@ -112,39 +104,24 @@ def insert(request, headers):
                 ))
                 id_viaje = cursor.lastrowid
 
-                # Detalle Combustible
+                # 2. Combustible (Solo si marcó "Si")
                 if data.get("lleno_combustible") == "Si":
-                    sql_fuel = """
-                        INSERT INTO DETALLE_COMBUSTIBLE (id_viaje, tipo_combustible, precio_total, precio_unitario, url_comprobante)
-                        VALUES (%s, %s, %s, %s, %s)
-                    """
+                    sql_fuel = "INSERT INTO DETALLE_COMBUSTIBLE (id_viaje, tipo_combustible, precio_total, precio_unitario, url_comprobante) VALUES (%s, %s, %s, %s, %s)"
                     cursor.execute(sql_fuel, (id_viaje, data.get("tipo_combustible"), data.get("precio_total"), data.get("precio_unitario"), url_gas))
 
-                # Detalle Cochera
+                # 3. Cochera (Solo si marcó "Si")
                 if data.get("pago_cochera") == "Si":
-                    sql_cochera = """
-                        INSERT INTO DETALLE_COCHERA (id_viaje, monto_pagado, url_comprobante)
-                        VALUES (%s, %s, %s)
-                    """
+                    sql_cochera = "INSERT INTO DETALLE_COCHERA (id_viaje, monto_pagado, url_comprobante) VALUES (%s, %s, %s)"
                     cursor.execute(sql_cochera, (id_viaje, data.get("monto_cochera"), url_cochera))
 
                 conn.commit()
             
-            return (json.dumps({
-                "success": "Guardado correctamente", 
-                "id": id_viaje,
-                "url_gas": url_gas,
-                "url_cochera": url_cochera
-            }), 200, headers)
-
+            return (json.dumps({"success": True, "id": id_viaje, "url_gas": url_gas}), 200, headers)
         except Exception as e:
             conn.rollback()
-            logging.error(f"Error en proceso insert: {str(e)}")
             return (json.dumps({"error": str(e)}), 500, headers)
         finally:
             conn.close()
-    
-    return (json.dumps({"error": "Método POST no reconocido"}), 405, headers)
 
 @functions_framework.http
 def hello_http(request):
@@ -155,8 +132,9 @@ def hello_http(request):
     }
 
     if request.method == "OPTIONS":
-        return ("", 200, headers)
+        return ("", 204, headers)
 
+    # Validación de Token
     auth_header = request.headers.get("Authorization")
     if not auth_header:
         return (json.dumps({"error": "No token"}), 401, headers)
@@ -170,7 +148,7 @@ def hello_http(request):
 
     if request.method == "GET":
         return extraer(request, headers)
-    elif request.method == "POST":
+    if request.method == "POST":
         return insert(request, headers)
     
-    return (json.dumps({"error": "Invalid Method"}), 405, headers)
+    return (json.dumps({"error": "Método inválido"}), 405, headers)
