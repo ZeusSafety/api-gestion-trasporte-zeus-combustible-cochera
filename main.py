@@ -97,10 +97,11 @@ def insert(request, headers):
                     id_viaje = cursor.lastrowid
 
                     # 2. Lógica de Combustible
+                    url_gas = None
                     if data.get("lleno_combustible") == "Si":
-                        url_gas = None
                         if "file_combustible" in request.files:
                             url_gas = subir_comprobante(request.files["file_combustible"])
+                            logging.info(f"URL Combustible generada: {url_gas}") # Debug
                         
                         sql_fuel = """
                             INSERT INTO DETALLE_COMBUSTIBLE (id_viaje, tipo_combustible, precio_total, precio_unitario, url_comprobante)
@@ -109,10 +110,11 @@ def insert(request, headers):
                         cursor.execute(sql_fuel, (id_viaje, data.get("tipo_combustible"), data.get("precio_total"), data.get("precio_unitario"), url_gas))
 
                     # 3. Lógica de Cochera
+                    url_cochera = None
                     if data.get("pago_cochera") == "Si":
-                        url_cochera = None
                         if "file_cochera" in request.files:
                             url_cochera = subir_comprobante(request.files["file_cochera"])
+                            logging.info(f"URL Cochera generada: {url_cochera}") # Debug
 
                         sql_cochera = """
                             INSERT INTO DETALLE_COCHERA (id_viaje, monto_pagado, url_comprobante)
@@ -121,13 +123,12 @@ def insert(request, headers):
                         cursor.execute(sql_cochera, (id_viaje, data.get("monto_cochera"), url_cochera))
 
                     conn.commit()
-                    return (json.dumps({"success": "Guardado correctamente", "id": id_viaje}), 200, headers)
+                    return (json.dumps({"success": "Guardado", "id": id_viaje, "url_gas": url_gas}), 200, headers)
 
                 except Exception as e:
                     conn.rollback()
+                    logging.error(f"Error en insert: {str(e)}")
                     return (json.dumps({"error": str(e)}), 500, headers)
-            
-            return (json.dumps({"error": "Método POST no reconocido"}), 405, headers)
 
 @functions_framework.http
 def hello_http(request):
